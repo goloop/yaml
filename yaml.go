@@ -18,7 +18,26 @@ import (
 // Keys the target does not know are ignored, as in encoding/json.
 //
 // An empty document leaves v untouched.
+//
+// Errors are *SyntaxError when the document is malformed and *TypeError
+// when it does not fit v; both carry the line number.
 func Unmarshal(data []byte, v any) error {
+	return unmarshal(data, v, false)
+}
+
+// UnmarshalStrict is Unmarshal, except that a mapping key the target
+// struct does not know is an error rather than something to skip.
+//
+// Use it for a file a person maintains by hand. Ignoring unknown keys is
+// right for a document that several versions of a program must read; it
+// is wrong for a configuration file, where the unknown key is almost
+// always a typo in a known one, and skipping it means the setting the
+// author wrote simply never takes effect.
+func UnmarshalStrict(data []byte, v any) error {
+	return unmarshal(data, v, true)
+}
+
+func unmarshal(data []byte, v any, strict bool) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return fmt.Errorf("yaml: Unmarshal needs a non-nil pointer, got %T", v)
@@ -30,7 +49,7 @@ func Unmarshal(data []byte, v any) error {
 	if root == nil {
 		return nil
 	}
-	d := &decoder{}
+	d := &decoder{strict: strict}
 	return d.unmarshal(root, rv.Elem())
 }
 

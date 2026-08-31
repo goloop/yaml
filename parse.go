@@ -1,7 +1,6 @@
 package yaml
 
 import (
-	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -51,10 +50,6 @@ type parser struct {
 	li      int // current line index
 	anchors map[string]*node
 	depth   int
-}
-
-func syntaxErr(line int, format string, args ...any) error {
-	return fmt.Errorf("yaml: line %d: %s", line, fmt.Sprintf(format, args...))
 }
 
 // parse turns a document into a node tree. A nil root with a nil error
@@ -188,6 +183,13 @@ func (p *parser) enter(line int) error {
 
 func (p *parser) leave() { p.depth-- }
 
+// isSeqEntry reports whether a line opens a block sequence entry. The
+// dash has to be followed by a break or by blank space, so that "-item"
+// stays a plain scalar.
+func isSeqEntry(s string) bool {
+	return s == "-" || strings.HasPrefix(s, "- ") || strings.HasPrefix(s, "-\t")
+}
+
 // isDocEnd reports a "---" or "..." marker line, which terminates any
 // open block node. It trims the line itself, so callers may hand it the
 // raw content.
@@ -257,7 +259,7 @@ func (p *parser) parseBlockNode(minCol, base int) (*node, error) {
 	switch {
 	case rest == "?" || strings.HasPrefix(rest, "? "):
 		return nil, syntaxErr(p.line(), "explicit mapping keys are not supported")
-	case rest == "-" || strings.HasPrefix(rest, "- "):
+	case isSeqEntry(rest):
 		return p.parseBlockSeq(col)
 	case rest[0] == '*':
 		n, after, err := p.alias(rest, p.line())
@@ -394,7 +396,10 @@ func splitKey(s string, line int) (key string, style scalarStyle, rest string, o
 			if s[0] == '"' {
 				st = styleDouble
 			}
-			return raw, st, strings.TrimPrefix(after[1:], " "), true, nil
+			// Every blank between the colon and the value is separation,
+			// not content: trimming only one would leave the rest inside
+			// the value and hide its opening quote from the caller.
+			return raw, st, strings.TrimLeft(after[1:], " \t"), true, nil
 		}
 		return "", 0, "", false, nil
 	}
@@ -408,7 +413,7 @@ func splitKey(s string, line int) (key string, style scalarStyle, rest string, o
 				if key == "" {
 					return "", 0, "", false, syntaxErr(line, "empty mapping key")
 				}
-				rest = strings.TrimLeft(s[i+1:], " ")
+				rest = strings.TrimLeft(s[i+1:], " \t")
 				return key, stylePlain, rest, true, nil
 			}
 		case '#':
@@ -605,7 +610,7 @@ func (p *parser) parseMapValue(keyCol int, rest string) (*node, error) {
 			case c > keyCol:
 				vn, err = p.parseBlockNode(keyCol+1, keyCol)
 			case c == keyCol && !isDocEnd(strings.TrimRight(content, " ")) &&
-				(content == "-" || strings.HasPrefix(content, "- ")):
+				isSeqEntry(content):
 				vn, err = p.parseBlockSeq(keyCol)
 			}
 			if err != nil {
@@ -648,7 +653,7 @@ func (p *parser) parseMapValue(keyCol int, rest string) (*node, error) {
 			return nil, qerr
 		}
 		vn = n
-	case rest == "-" || strings.HasPrefix(rest, "- "):
+	case isSeqEntry(rest):
 		return nil, syntaxErr(p.line(),
 			"block sequence entries are not allowed on the same line as a mapping key")
 	default:
@@ -690,10 +695,10 @@ func (p *parser) parseBlockSeq(col int) (*node, error) {
 		if c > col {
 			return nil, syntaxErr(p.line(), "unexpected indentation")
 		}
-		if content != "-" && !strings.HasPrefix(content, "- ") {
+		if !isSeqEntry(content) {
 			return s, nil
 		}
-		rest := strings.TrimLeft(content[1:], " ")
+		rest := strings.TrimLeft(content[1:], " \t")
 		var item *node
 		if strings.TrimSpace(rest) == "" || isCommentOnly(rest) {
 			p.li++
@@ -748,7 +753,7 @@ func (p *parser) parseScalar(col, base int) (*node, error) {
 		} else if isKey {
 			break
 		}
-		if content == "-" || strings.HasPrefix(content, "- ") {
+		if isSeqEntry(content) {
 			break
 		}
 		frag = strings.TrimRight(cutComment(content), " \t")

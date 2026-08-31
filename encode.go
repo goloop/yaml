@@ -111,7 +111,10 @@ func (e *encoder) writeMap(v reflect.Value, indent int) error {
 }
 
 func (e *encoder) writeStruct(v reflect.Value, indent int) error {
-	fs := cachedFields(v.Type())
+	fs, err := cachedFields(v.Type())
+	if err != nil {
+		return err
+	}
 	written := 0
 	for i := range fs.list {
 		f := &fs.list[i]
@@ -269,7 +272,13 @@ func emptyCollection(v reflect.Value) (bool, string) {
 	case reflect.Slice, reflect.Array:
 		return v.Len() == 0, "[]"
 	case reflect.Struct:
-		return len(cachedFields(v.Type()).list) == 0, "{}"
+		fs, err := cachedFields(v.Type())
+		if err != nil {
+			// The error surfaces from writeStruct, which is reached
+			// straight after this test.
+			return false, ""
+		}
+		return len(fs.list) == 0, "{}"
 	}
 	return false, ""
 }
@@ -368,8 +377,8 @@ func needsQuotes(s string) bool {
 	if strings.TrimSpace(s) != s {
 		return true
 	}
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; c < 0x20 || c == 0x7f {
+	for _, r := range s {
+		if breaksLine(r) {
 			return true
 		}
 	}
@@ -399,6 +408,14 @@ func needsQuotes(s string) bool {
 	return false
 }
 
+// breaksLine reports characters that a reader may treat as ending the
+// line. The ASCII controls are obvious; U+0085, U+2028 and U+2029 are
+// not, and a reader that honours them would see a one-line scalar as
+// two, so they can never be written bare.
+func breaksLine(r rune) bool {
+	return r < 0x20 || r == 0x7f || r == '\u0085' || r == '\u2028' || r == '\u2029'
+}
+
 func quote(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 2)
@@ -415,6 +432,12 @@ func quote(s string) string {
 			b.WriteString(`\r`)
 		case '\t':
 			b.WriteString(`\t`)
+		case '\u0085':
+			b.WriteString(`\N`)
+		case '\u2028':
+			b.WriteString(`\L`)
+		case '\u2029':
+			b.WriteString(`\P`)
 		default:
 			if r < 0x20 || r == 0x7f {
 				fmt.Fprintf(&b, `\x%02x`, r)

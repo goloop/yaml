@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -12,8 +13,9 @@ import (
 // Aliases are shared pointers, so a small document can describe a very
 // large tree; ops counts what is actually visited and stops it.
 type decoder struct {
-	ops   int
-	depth int
+	ops    int
+	depth  int
+	strict bool // a key the target does not know is an error
 }
 
 func (d *decoder) step() error {
@@ -25,7 +27,7 @@ func (d *decoder) step() error {
 }
 
 func (d *decoder) typeErr(n *node, t reflect.Type, what string) error {
-	return fmt.Errorf("yaml: line %d: cannot decode %s into %s", n.line, what, t)
+	return typeErr(n.line, "cannot decode %s into %s", what, t)
 }
 
 // unmarshal writes the node into v, which must be settable.
@@ -36,7 +38,7 @@ func (d *decoder) unmarshal(n *node, v reflect.Value) error {
 	d.depth++
 	defer func() { d.depth-- }()
 	if d.depth > maxDepth {
-		return fmt.Errorf("yaml: line %d: nesting is too deep", n.line)
+		return typeErr(n.line, "nesting is too deep")
 	}
 
 	u, out := indirect(v, n.isNull(), n.kind == scalarNode)
@@ -66,7 +68,7 @@ func (d *decoder) unmarshal(n *node, v reflect.Value) error {
 // here: a type that parses text has nothing to do with a mapping.
 func (d *decoder) text(n *node, u encoding.TextUnmarshaler) error {
 	if err := u.UnmarshalText([]byte(n.value)); err != nil {
-		return fmt.Errorf("yaml: line %d: %w", n.line, err)
+		return &TypeError{Line: n.line, Msg: err.Error()}
 	}
 	return nil
 }
@@ -112,6 +114,18 @@ func indirect(v reflect.Value, isNull, allowText bool) (encoding.TextUnmarshaler
 		}
 	}
 	return nil, v
+}
+
+// isTextTarget reports whether v declares that it is built from text.
+func isTextTarget(v reflect.Value) bool {
+	if v.CanAddr() {
+		if pv := v.Addr(); pv.Type().NumMethod() > 0 && pv.CanInterface() {
+			if _, ok := pv.Interface().(encoding.TextUnmarshaler); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (d *decoder) scalar(n *node, v reflect.Value) error {
@@ -161,7 +175,7 @@ func (d *decoder) scalar(n *node, v reflect.Value) error {
 			return d.typeErr(n, v.Type(), kind.String())
 		}
 		if v.OverflowInt(i) {
-			return fmt.Errorf("yaml: line %d: %d overflows %s", n.line, i, v.Type())
+			return typeErr(n.line, "%d overflows %s", i, v.Type())
 		}
 		v.SetInt(i)
 		return nil
@@ -173,10 +187,10 @@ func (d *decoder) scalar(n *node, v reflect.Value) error {
 			return d.typeErr(n, v.Type(), kind.String())
 		}
 		if i < 0 {
-			return fmt.Errorf("yaml: line %d: %d is negative, %s is not", n.line, i, v.Type())
+			return typeErr(n.line, "%d is negative, %s is not", i, v.Type())
 		}
 		if v.OverflowUint(uint64(i)) {
-			return fmt.Errorf("yaml: line %d: %d overflows %s", n.line, i, v.Type())
+			return typeErr(n.line, "%d overflows %s", i, v.Type())
 		}
 		v.SetUint(uint64(i))
 		return nil
@@ -229,8 +243,8 @@ func (d *decoder) sequence(n *node, v reflect.Value) error {
 
 	case reflect.Array:
 		if len(n.items) > v.Len() {
-			return fmt.Errorf("yaml: line %d: sequence of %d does not fit %s",
-				n.line, len(n.items), v.Type())
+			return typeErr(n.line, "sequence of %d does not fit %s",
+				len(n.items), v.Type())
 		}
 		for i, item := range n.items {
 			if err := d.unmarshal(item, v.Index(i)); err != nil {
@@ -286,10 +300,24 @@ func (d *decoder) mapping(n *node, v reflect.Value) error {
 		return nil
 
 	case reflect.Struct:
-		fields := cachedFields(v.Type())
+		// A type that parses itself from text has no business being
+		// filled key by key: reaching here means the document holds a
+		// mapping where the target wanted a scalar, and every key would
+		// be silently dropped as "unknown".
+		if isTextTarget(v) {
+			return d.typeErr(n, v.Type(), "a mapping")
+		}
+		fields, err := cachedFields(v.Type())
+		if err != nil {
+			return err
+		}
 		for i, k := range keys {
 			f := fields.lookup(k.value)
 			if f == nil {
+				if d.strict {
+					return typeErr(k.line,
+						"unknown key %q for %s", k.value, v.Type())
+				}
 				// Unknown keys are ignored, as in encoding/json: a
 				// config file may carry keys this build does not know.
 				continue
@@ -323,6 +351,13 @@ func (d *decoder) merged(n *node) ([]*node, []*node, error) {
 		}
 		if k.kind != scalarNode {
 			return nil, nil, syntaxErr(k.line, "mapping keys must be scalars")
+		}
+		// A null names nothing. Letting it through would decode to the
+		// empty key, where it would collide with a real "" key and one
+		// of the two values would vanish without a word.
+		if k.isNull() {
+			return nil, nil, syntaxErr(k.line,
+				"a null mapping key has no name; quote it to use it as text")
 		}
 		if k.value == "<<" && k.style == stylePlain && k.tag == "" {
 			merges = append(merges, n.vals[i])
@@ -404,6 +439,7 @@ type field struct {
 	name      string
 	index     []int
 	omitEmpty bool
+	depth     int // embedding levels below the outer struct
 }
 
 type fields struct {
@@ -425,25 +461,36 @@ func (f *fields) lookup(name string) *field {
 	return nil
 }
 
-var fieldCache sync.Map // reflect.Type -> *fields
+type cachedType struct {
+	fields *fields
+	err    error
+}
 
-func cachedFields(t reflect.Type) *fields {
-	if f, ok := fieldCache.Load(t); ok {
-		return f.(*fields)
+var fieldCache sync.Map // reflect.Type -> *cachedType
+
+func cachedFields(t reflect.Type) (*fields, error) {
+	if c, ok := fieldCache.Load(t); ok {
+		e := c.(*cachedType)
+		return e.fields, e.err
 	}
-	f := typeFields(t)
-	fieldCache.Store(t, f)
-	return f
+	f, err := typeFields(t)
+	fieldCache.Store(t, &cachedType{fields: f, err: err})
+	return f, err
 }
 
 // typeFields flattens a struct into the keys it answers to. An embedded
-// struct with no name of its own contributes its fields directly, and a
-// shallower field wins over a deeper one of the same name.
-func typeFields(t reflect.Type) *fields {
-	out := &fields{byKey: map[string]int{}}
-	var walk func(t reflect.Type, index []int)
+// struct with no name of its own contributes its fields directly.
+//
+// Depth decides collisions: a field the struct declares itself always
+// wins over one of the same name reached through an embedded struct, no
+// matter which is met first. That is what encoding/json does, and a
+// struct that behaves differently under the two encoders would be a trap
+// rather than a feature.
+func typeFields(t reflect.Type) (*fields, error) {
+	var found []field
+	var walk func(t reflect.Type, index []int, depth int) error
 
-	walk = func(t reflect.Type, index []int) {
+	walk = func(t reflect.Type, index []int, depth int) error {
 		for i := 0; i < t.NumField(); i++ {
 			sf := t.Field(i)
 			tag := sf.Tag.Get("yaml")
@@ -452,15 +499,24 @@ func typeFields(t reflect.Type) *fields {
 			}
 			name, opts := splitTag(tag)
 
+			embedded := false
+			var et reflect.Type
 			if sf.Anonymous && name == "" {
-				ft := sf.Type
-				if ft.Kind() == reflect.Pointer {
-					ft = ft.Elem()
+				et = sf.Type
+				if et.Kind() == reflect.Pointer {
+					et = et.Elem()
 				}
-				if ft.Kind() == reflect.Struct {
-					walk(ft, append(append([]int{}, index...), i))
-					continue
+				embedded = et.Kind() == reflect.Struct
+			}
+			if err := opts.check(t, sf.Name, embedded); err != nil {
+				return err
+			}
+			if embedded {
+				if err := walk(et, append(append([]int{}, index...), i),
+					depth+1); err != nil {
+					return err
 				}
+				continue
 			}
 			if !sf.IsExported() {
 				continue
@@ -471,20 +527,55 @@ func typeFields(t reflect.Type) *fields {
 				// read a normal config file.
 				name = strings.ToLower(sf.Name)
 			}
-			if _, dup := out.byKey[name]; dup {
-				continue
-			}
-			out.byKey[name] = len(out.list)
-			out.list = append(out.list, field{
+			found = append(found, field{
 				name:      name,
 				index:     append(append([]int{}, index...), i),
 				omitEmpty: opts.has("omitempty"),
+				depth:     depth,
 			})
 		}
+		return nil
 	}
 
-	walk(t, nil)
-	return out
+	if err := walk(t, nil, 0); err != nil {
+		return nil, err
+	}
+
+	// Shallowest wins, and among equals the one declared first. Sorting
+	// is stable so declaration order survives for everything else, which
+	// is the order Marshal writes fields in.
+	sort.SliceStable(found, func(i, j int) bool {
+		return found[i].depth < found[j].depth
+	})
+
+	out := &fields{byKey: make(map[string]int, len(found))}
+	for _, f := range found {
+		if _, dup := out.byKey[f.name]; dup {
+			continue
+		}
+		out.byKey[f.name] = len(out.list)
+		out.list = append(out.list, f)
+	}
+	// Writing follows declaration order, not the depth order used to
+	// resolve collisions.
+	sort.SliceStable(out.list, func(i, j int) bool {
+		return lessIndex(out.list[i].index, out.list[j].index)
+	})
+	for i := range out.list {
+		out.byKey[out.list[i].name] = i
+	}
+	return out, nil
+}
+
+// lessIndex orders fields the way they are laid out in the struct, so an
+// embedded struct's fields appear where the embedding is declared.
+func lessIndex(a, b []int) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
 }
 
 type tagOptions string
@@ -492,6 +583,39 @@ type tagOptions string
 func splitTag(tag string) (string, tagOptions) {
 	name, opts, _ := strings.Cut(tag, ",")
 	return name, tagOptions(opts)
+}
+
+// check refuses options this package does not implement. Silently
+// ignoring one is how a tag comes to drop half a config file without a
+// word: the author wrote an instruction and nothing carried it out.
+func (o tagOptions) check(t reflect.Type, fieldName string, embedded bool) error {
+	rest := string(o)
+	for rest != "" {
+		var opt string
+		opt, rest, _ = strings.Cut(rest, ",")
+		switch opt {
+		case "", "omitempty":
+		case "inline":
+			// On an embedded struct the option asks for the flattening
+			// this package already does, so it costs nothing to honour
+			// and lets a struct written for either encoder work here.
+			// On a named field it asks for a catch-all that is not
+			// implemented, and ignoring it would drop every key that
+			// was meant to land in it.
+			if embedded {
+				continue
+			}
+			return fmt.Errorf(
+				"yaml: %s.%s: \"inline\" is only supported on an embedded "+
+					"struct, not on a named field", t.Name(), fieldName)
+		default:
+			return fmt.Errorf(
+				"yaml: %s.%s: unsupported tag option %q "+
+					"(this package supports \"omitempty\" and \"-\")",
+				t.Name(), fieldName, opt)
+		}
+	}
+	return nil
 }
 
 func (o tagOptions) has(want string) bool {

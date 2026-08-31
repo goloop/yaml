@@ -34,8 +34,11 @@ if err := yaml.Unmarshal(data, &c); err != nil {
 - Anchors (`&a`), aliases (`*a`) and `<<` merge keys.
 - Core-schema tags `!!str`, `!!int`, `!!float`, `!!bool`, `!!null` to
   force an interpretation.
-- Errors carry the line number, because a config file that fails to load
-  is read by a person looking for the mistake.
+- Errors carry the line number in a typed value (`*SyntaxError`,
+  `*TypeError`), because a config file that fails to load is read by a
+  person looking for the mistake.
+- `UnmarshalStrict` turns an unknown key into an error, which is what a
+  hand-edited file wants: the unknown key is nearly always a typo.
 - Deterministic output: the same value always encodes to the same bytes,
   so a generated file does not churn in version control.
 - Safe on untrusted input: alias cycles are unrepresentable, alias
@@ -47,6 +50,22 @@ if err := yaml.Unmarshal(data, &c); err != nil {
 ```shell
 go get github.com/goloop/yaml
 ```
+
+## Differences from YAML 1.1 readers
+
+The core schema is YAML 1.2, and the places where 1.1 disagreed are the
+places configuration files go wrong. Each of these is a decision, not an
+oversight:
+
+| Written | Here | Under YAML 1.1 |
+|---|---|---|
+| `yes`, `no`, `on`, `off` | string (a `bool` field still takes them) | boolean |
+| `0644` | refused as ambiguous | octal, 420 |
+| `1_000` | string | 1000 |
+| `2026-08-30` | string (give the field a type with `UnmarshalText`) | timestamp |
+| `~` as a mapping key | refused; it names nothing | dropped silently |
+| embedded struct, no tag | flattened, as in `encoding/json` | nested under its type name |
+| embedded struct, `,inline` | flattened | flattened |
 
 ## Two things worth knowing up front
 

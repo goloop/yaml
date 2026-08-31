@@ -12,6 +12,13 @@
 //	var c Config
 //	err := yaml.Unmarshal(data, &c)
 //
+// UnmarshalStrict is the same, except that a key the target does not
+// know is an error. For a file a person edits by hand that is usually
+// what you want: an unknown key is nearly always a typo in a known one.
+//
+// Errors are *SyntaxError when the document is malformed and *TypeError
+// when it does not fit the target. Both carry the line number.
+//
 // # Supported YAML
 //
 // The package covers the YAML that configuration and manifest files are
