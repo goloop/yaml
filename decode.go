@@ -13,9 +13,9 @@ import (
 // Aliases are shared pointers, so a small document can describe a very
 // large tree; ops counts what is actually visited and stops it.
 type decoder struct {
-	ops    int
-	depth  int
-	strict bool // a key the target does not know is an error
+	ops   int
+	depth int
+	s     settings
 }
 
 func (d *decoder) step() error {
@@ -32,6 +32,20 @@ func (d *decoder) typeErr(n *node, t reflect.Type, what string) error {
 
 // unmarshal writes the node into v, which must be settable.
 func (d *decoder) unmarshal(n *node, v reflect.Value) error {
+	return d.unmarshalField(n, v, "")
+}
+
+// unmarshalField is unmarshal with the layout a field's tag asked for.
+// The layout travels into the elements of a sequence, because a list of
+// times is one field with one format, but not into the fields of a
+// nested struct, which carry tags of their own.
+//
+// The order here is the contract: a parser the caller registered wins
+// over everything, then a type that decodes itself, then the types this
+// package knows by name, then the text interface, then the plain kinds.
+// A registered parser is the way in for a type that can do none of the
+// above, so anything overtaking it would close the only door.
+func (d *decoder) unmarshalField(n *node, v reflect.Value, layout string) error {
 	if err := d.step(); err != nil {
 		return err
 	}
@@ -39,6 +53,30 @@ func (d *decoder) unmarshal(n *node, v reflect.Value) error {
 	defer func() { d.depth-- }()
 	if d.depth > maxDepth {
 		return typeErr(n.line, "nesting is too deep")
+	}
+
+	if p, ok := d.parser(v.Type()); ok {
+		return d.applyParser(n, v, p)
+	}
+	if hu, _ := indirectUnmarshaler(v, n.isNull()); hu != nil {
+		return d.hook(n, hu, layout)
+	}
+
+	// time.Time implements the text interface, and taking that path
+	// would pin it to RFC3339 and quietly ignore the layout the field
+	// asked for. The types this package names are settled here instead.
+	if n.kind == scalarNode && isSpecialType(baseType(v.Type())) {
+		_, out := indirect(v, n.isNull(), false)
+		if !out.IsValid() {
+			return nil
+		}
+		if n.isNull() {
+			out.SetZero()
+			return nil
+		}
+		if ok, err := d.special(n, out, layout); ok {
+			return err
+		}
 	}
 
 	u, out := indirect(v, n.isNull(), n.kind == scalarNode)
@@ -55,11 +93,11 @@ func (d *decoder) unmarshal(n *node, v reflect.Value) error {
 
 	switch n.kind {
 	case scalarNode:
-		return d.scalar(n, out)
+		return d.scalar(n, out, layout)
 	case seqNode:
-		return d.sequence(n, out)
+		return d.sequence(n, out, layout)
 	case mapNode:
-		return d.mapping(n, out)
+		return d.mapping(n, out, layout)
 	}
 	return nil
 }
@@ -128,7 +166,14 @@ func isTextTarget(v reflect.Value) bool {
 	return false
 }
 
-func (d *decoder) scalar(n *node, v reflect.Value) error {
+func (d *decoder) scalar(n *node, v reflect.Value, layout string) error {
+	// The types this package builds from a scalar itself are checked
+	// before the kinds, because time.Duration is an int64 and would
+	// otherwise be filled with a raw count of nanoseconds.
+	if ok, err := d.special(n, v, layout); ok {
+		return err
+	}
+
 	kind, val, err := n.resolve()
 	if err != nil {
 		return err
@@ -216,7 +261,7 @@ func (d *decoder) scalar(n *node, v reflect.Value) error {
 	return d.typeErr(n, v.Type(), kind.String())
 }
 
-func (d *decoder) sequence(n *node, v reflect.Value) error {
+func (d *decoder) sequence(n *node, v reflect.Value, layout string) error {
 	switch v.Kind() {
 	case reflect.Interface:
 		if v.NumMethod() != 0 {
@@ -224,7 +269,8 @@ func (d *decoder) sequence(n *node, v reflect.Value) error {
 		}
 		out := make([]any, len(n.items))
 		for i, item := range n.items {
-			if err := d.unmarshal(item, reflect.ValueOf(&out[i]).Elem()); err != nil {
+			if err := d.unmarshalField(item,
+				reflect.ValueOf(&out[i]).Elem(), layout); err != nil {
 				return err
 			}
 		}
@@ -234,7 +280,7 @@ func (d *decoder) sequence(n *node, v reflect.Value) error {
 	case reflect.Slice:
 		out := reflect.MakeSlice(v.Type(), len(n.items), len(n.items))
 		for i, item := range n.items {
-			if err := d.unmarshal(item, out.Index(i)); err != nil {
+			if err := d.unmarshalField(item, out.Index(i), layout); err != nil {
 				return err
 			}
 		}
@@ -247,7 +293,7 @@ func (d *decoder) sequence(n *node, v reflect.Value) error {
 				len(n.items), v.Type())
 		}
 		for i, item := range n.items {
-			if err := d.unmarshal(item, v.Index(i)); err != nil {
+			if err := d.unmarshalField(item, v.Index(i), layout); err != nil {
 				return err
 			}
 		}
@@ -259,7 +305,7 @@ func (d *decoder) sequence(n *node, v reflect.Value) error {
 	return d.typeErr(n, v.Type(), "a sequence")
 }
 
-func (d *decoder) mapping(n *node, v reflect.Value) error {
+func (d *decoder) mapping(n *node, v reflect.Value, layout string) error {
 	keys, vals, err := d.merged(n)
 	if err != nil {
 		return err
@@ -292,7 +338,7 @@ func (d *decoder) mapping(n *node, v reflect.Value) error {
 				return err
 			}
 			ev := reflect.New(et).Elem()
-			if err := d.unmarshal(vals[i], ev); err != nil {
+			if err := d.unmarshalField(vals[i], ev, layout); err != nil {
 				return err
 			}
 			v.SetMapIndex(kv, ev)
@@ -311,10 +357,15 @@ func (d *decoder) mapping(n *node, v reflect.Value) error {
 		if err != nil {
 			return err
 		}
+		// Presence is decided here, after merged() has expanded any
+		// "<<" keys: the decoder, a strict decode and the required flag
+		// must all be looking at the same mapping, or they would
+		// disagree about what it means for a key to be there.
+		filled := make([]bool, len(fields.list))
 		for i, k := range keys {
-			f := fields.lookup(k.value)
-			if f == nil {
-				if d.strict {
+			fi := fields.lookupIndex(k.value)
+			if fi < 0 {
+				if d.s.strict {
 					return typeErr(k.line,
 						"unknown key %q for %s", k.value, v.Type())
 				}
@@ -322,15 +373,17 @@ func (d *decoder) mapping(n *node, v reflect.Value) error {
 				// config file may carry keys this build does not know.
 				continue
 			}
-			fv, err := fieldByIndex(v, f.index)
+			filled[fi] = true
+			fv, err := fieldByIndex(v, fields.list[fi].index)
 			if err != nil {
 				return err
 			}
-			if err := d.unmarshal(vals[i], fv); err != nil {
+			if err := d.unmarshalField(vals[i], fv,
+				fields.list[fi].layout); err != nil {
 				return err
 			}
 		}
-		return nil
+		return d.absent(n, v, fields, filled)
 	}
 	return d.typeErr(n, v.Type(), "a mapping")
 }
@@ -439,6 +492,11 @@ type field struct {
 	name      string
 	index     []int
 	omitEmpty bool
+	required  bool   // the key must be in the document
+	def       string // def tag: value used when the key is absent
+	hasDef    bool   // the def tag was present, even if empty
+	layout    string // layout tag: time.Time layout for this field
+	typ       reflect.Type
 	depth     int // embedding levels below the outer struct
 }
 
@@ -450,15 +508,25 @@ type fields struct {
 // lookup finds the field for a YAML key: exactly first, then ignoring
 // case, the way encoding/json resolves names.
 func (f *fields) lookup(name string) *field {
-	if i, ok := f.byKey[name]; ok {
+	if i := f.lookupIndex(name); i >= 0 {
 		return &f.list[i]
+	}
+	return nil
+}
+
+// lookupIndex finds the field for a YAML key: exactly first, then
+// ignoring case, the way encoding/json resolves names. It returns -1
+// when the target has no such field.
+func (f *fields) lookupIndex(name string) int {
+	if i, ok := f.byKey[name]; ok {
+		return i
 	}
 	for i := range f.list {
 		if strings.EqualFold(f.list[i].name, name) {
-			return &f.list[i]
+			return i
 		}
 	}
-	return nil
+	return -1
 }
 
 type cachedType struct {
@@ -527,10 +595,25 @@ func typeFields(t reflect.Type) (*fields, error) {
 				// read a normal config file.
 				name = strings.ToLower(sf.Name)
 			}
+			def, hasDef := sf.Tag.Lookup("def")
+			required := opts.has("required")
+			if required && hasDef {
+				return fmt.Errorf(
+					"yaml: %s.%s: \"required\" and a def default contradict "+
+						"each other: a field cannot both have to be in the "+
+						"document and have a value for when it is not",
+					t.Name(), sf.Name)
+			}
+
 			found = append(found, field{
 				name:      name,
 				index:     append(append([]int{}, index...), i),
 				omitEmpty: opts.has("omitempty"),
+				required:  required,
+				def:       def,
+				hasDef:    hasDef,
+				layout:    sf.Tag.Get("layout"),
+				typ:       sf.Type,
 				depth:     depth,
 			})
 		}
@@ -594,7 +677,7 @@ func (o tagOptions) check(t reflect.Type, fieldName string, embedded bool) error
 		var opt string
 		opt, rest, _ = strings.Cut(rest, ",")
 		switch opt {
-		case "", "omitempty":
+		case "", "omitempty", "required":
 		case "inline":
 			// On an embedded struct the option asks for the flattening
 			// this package already does, so it costs nothing to honour
@@ -611,7 +694,8 @@ func (o tagOptions) check(t reflect.Type, fieldName string, embedded bool) error
 		default:
 			return fmt.Errorf(
 				"yaml: %s.%s: unsupported tag option %q "+
-					"(this package supports \"omitempty\" and \"-\")",
+					"(this package supports \"omitempty\", \"required\" "+
+					"and \"-\")",
 				t.Name(), fieldName, opt)
 		}
 	}

@@ -4,7 +4,9 @@
 
 `yaml` reads and writes the de-facto YAML configuration format, with the
 API of `encoding/json`: `Marshal`, `Unmarshal`, struct tags,
-`encoding.TextMarshaler` and `encoding.TextUnmarshaler`.
+`encoding.TextMarshaler` and `encoding.TextUnmarshaler` - plus the things
+a configuration file actually needs: defaults, required keys, durations,
+times, URLs, and environment expansion when you ask for it.
 
 It is deliberately not a complete YAML 1.2 implementation. It covers what
 configuration files, manifests and fixtures are actually made of, and it
@@ -24,6 +26,25 @@ if err := yaml.Unmarshal(data, &c); err != nil {
 }
 ```
 
+Loading a file a person maintains, with the strictness that suits one:
+
+```go
+type Config struct {
+    Host    string        `yaml:"host" def:"localhost"`
+    Port    int           `yaml:"port" def:"8080"`
+    Secret  string        `yaml:"secret,required"`
+    Timeout time.Duration `yaml:"timeout" def:"30s"`
+    Since   time.Time     `yaml:"since" layout:"DateOnly"`
+    API     url.URL       `yaml:"api"`
+}
+
+var c Config
+err := yaml.UnmarshalFile("config.yaml", &c,
+    yaml.WithStrict(),       // an unknown key is a typo, not a feature
+    yaml.WithExpandStrict(), // ${DB_HOST}, and say so if it is not set
+)
+```
+
 ## Features
 
 - The `encoding/json` mapping: struct tags, `omitempty`, `-`, embedded
@@ -36,9 +57,20 @@ if err := yaml.Unmarshal(data, &c); err != nil {
   force an interpretation.
 - Errors carry the line number in a typed value (`*SyntaxError`,
   `*TypeError`), because a config file that fails to load is read by a
-  person looking for the mistake.
-- `UnmarshalStrict` turns an unknown key into an error, which is what a
+  person looking for the mistake, and sentinel errors for `errors.Is`.
+- `WithStrict` turns an unknown key into an error, which is what a
   hand-edited file wants: the unknown key is nearly always a typo.
+- `def` defaults and `,required` keys, decided after `<<` merges, so a
+  missing setting is caught at load time rather than at the first request
+  that needs it.
+- `time.Duration` from `30s`, `time.Time` with a per-field `layout`, and
+  `url.URL` as the text it was written as.
+- `WithExpand` substitutes `${NAME}` and `$NAME` from the environment,
+  without the shell's positional parameters - so `cost: $100` and
+  `pa$$word` stay what they are.
+- `File`, `Reader`, `Writer` and `String` forms of both directions.
+- `WithParser` and `WithEncoder` for a type that is not yours to change,
+  and `UnmarshalYAML` / `MarshalYAML` for one that is.
 - Deterministic output: the same value always encodes to the same bytes,
   so a generated file does not churn in version control.
 - Safe on untrusted input: alias cycles are unrepresentable, alias
@@ -67,7 +99,7 @@ oversight:
 | embedded struct, no tag | flattened, as in `encoding/json` | nested under its type name |
 | embedded struct, `,inline` | flattened | flattened |
 
-## Two things worth knowing up front
+## Three things worth knowing up front
 
 **`yes` and `no` are strings.** Scalars resolve by the YAML 1.2 core
 schema, where the booleans are `true` and `false` and nothing else. A
@@ -84,6 +116,11 @@ yaml: line 1: "0644" is ambiguous: a leading zero meant octal in YAML 1.1
 and decimal in 1.2; write 0o644 for octal, 644 for decimal, or quote it
 for a string
 ```
+
+**A duration is a string.** `timeout: 30s`, not `timeout: 30`. A bare
+number would mean nanoseconds, which in a configuration file is never
+what anyone meant, so it is refused with a message saying how to write
+it.
 
 ## Out of scope
 

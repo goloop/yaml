@@ -1,0 +1,36 @@
+# The constructs a body of real configuration turned out to be made of.
+# Written for the test, not copied from anywhere.
+
+base: &defaults
+  timeout: 30s
+  retries: 3
+
+reused: *defaults
+
+merged:
+  <<: *defaults
+  retries: 5          # a key the mapping states wins over a merged one
+
+literal: |
+  line one
+  line two
+
+folded: >
+  one long line
+  of prose
+
+flow: [1, "two", { kind: rss, ident: "a-b" }]
+
+nested:
+  - name: first
+    tags: [alpha, beta]
+  - name: second
+    tags: []
+
+quoted_number: "8080"
+yes_is_a_string: yes
+hex: 0x1F
+empty_is_null:
+inline_comment: value    # trailing comments are not part of the value
+apostrophe: 'it''s quoted'
+escaped: "a\tb\nc"

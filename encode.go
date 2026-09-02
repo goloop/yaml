@@ -4,10 +4,12 @@ import (
 	"encoding"
 	"fmt"
 	"math"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -16,9 +18,59 @@ import (
 // indentation at all.
 const indentStep = 2
 
+// maxMarshalerHops caps how many times a value may hand the encoder
+// another value to write in its place. A type whose MarshalYAML returns
+// its own receiver is valid Go that would otherwise loop until the
+// stack ran out, and a stack overflow is not a diagnosis.
+const maxMarshalerHops = 16
+
 type encoder struct {
 	buf   strings.Builder
 	depth int
+	s     settings
+}
+
+// prepare follows pointers and interfaces, and lets a type that
+// marshals itself stand something else in its place, until what is left
+// is the value to write.
+func (e *encoder) prepare(v reflect.Value) (reflect.Value, error) {
+	for hops := 0; hops <= maxMarshalerHops; hops++ {
+		v = deref(v)
+		if !v.IsValid() {
+			return v, nil
+		}
+		m, ok := marshalerOf(v)
+		if !ok {
+			return v, nil
+		}
+		out, err := m.MarshalYAML()
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("yaml: %w", err)
+		}
+		v = reflect.ValueOf(out)
+	}
+	return reflect.Value{}, fmt.Errorf(
+		"yaml: MarshalYAML never settles on a value to write after %d "+
+			"substitutions (a type that returns itself would loop)",
+		maxMarshalerHops)
+}
+
+// marshalerOf reports the Marshaler v is, taking its address when it has
+// one, so a hook written on a pointer receiver is found on a field.
+func marshalerOf(v reflect.Value) (Marshaler, bool) {
+	if v.CanInterface() {
+		if m, ok := v.Interface().(Marshaler); ok {
+			return m, true
+		}
+	}
+	if v.Kind() != reflect.Pointer && v.CanAddr() {
+		if pv := v.Addr(); pv.CanInterface() {
+			if m, ok := pv.Interface().(Marshaler); ok {
+				return m, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (e *encoder) pad(n int) {
@@ -30,16 +82,19 @@ func (e *encoder) pad(n int) {
 // writeNode writes v at the current output position, which the caller
 // has already moved to column indent. Lines after the first indent
 // themselves.
-func (e *encoder) writeNode(v reflect.Value, indent int) error {
+func (e *encoder) writeNode(v reflect.Value, indent int, layout string) error {
 	e.depth++
 	defer func() { e.depth-- }()
 	if e.depth > maxDepth {
 		return fmt.Errorf("yaml: value nests deeper than %d levels", maxDepth)
 	}
 
-	v = deref(v)
+	v, err := e.prepare(v)
+	if err != nil {
+		return err
+	}
 
-	if txt, ok, err := scalarText(v); err != nil {
+	if txt, ok, err := e.scalarText(v, layout); err != nil {
 		return err
 	} else if ok {
 		e.buf.WriteString(txt)
@@ -49,21 +104,24 @@ func (e *encoder) writeNode(v reflect.Value, indent int) error {
 
 	switch v.Kind() {
 	case reflect.Map:
-		return e.writeMap(v, indent)
+		return e.writeMap(v, indent, layout)
 	case reflect.Struct:
 		return e.writeStruct(v, indent)
 	case reflect.Slice, reflect.Array:
-		return e.writeSeq(v, indent)
+		return e.writeSeq(v, indent, layout)
 	}
 	return fmt.Errorf("yaml: cannot encode %s", v.Type())
 }
 
 // writeEntry writes what follows a "key:" or a "-": a scalar continues
 // the line, a collection starts on the next one.
-func (e *encoder) writeEntry(v reflect.Value, indent int) error {
-	v = deref(v)
+func (e *encoder) writeEntry(v reflect.Value, indent int, layout string) error {
+	v, err := e.prepare(v)
+	if err != nil {
+		return err
+	}
 
-	if txt, ok, err := scalarText(v); err != nil {
+	if txt, ok, err := e.scalarText(v, layout); err != nil {
 		return err
 	} else if ok {
 		e.buf.WriteByte(' ')
@@ -80,16 +138,16 @@ func (e *encoder) writeEntry(v reflect.Value, indent int) error {
 	}
 
 	e.buf.WriteByte('\n')
-	e.pad(indent + indentStep)
-	return e.writeNode(v, indent+indentStep)
+	e.pad(indent + e.s.indent)
+	return e.writeNode(v, indent+e.s.indent, layout)
 }
 
-func (e *encoder) writeMap(v reflect.Value, indent int) error {
+func (e *encoder) writeMap(v reflect.Value, indent int, layout string) error {
 	if v.Len() == 0 {
 		e.buf.WriteString("{}\n")
 		return nil
 	}
-	keys, err := sortedKeys(v)
+	keys, err := e.sortedKeys(v)
 	if err != nil {
 		return err
 	}
@@ -97,13 +155,13 @@ func (e *encoder) writeMap(v reflect.Value, indent int) error {
 		if i > 0 {
 			e.pad(indent)
 		}
-		txt, err := keyText(k)
+		txt, err := e.keyText(k)
 		if err != nil {
 			return err
 		}
 		e.buf.WriteString(txt)
 		e.buf.WriteByte(':')
-		if err := e.writeEntry(v.MapIndex(k), indent); err != nil {
+		if err := e.writeEntry(v.MapIndex(k), indent, layout); err != nil {
 			return err
 		}
 	}
@@ -135,7 +193,7 @@ func (e *encoder) writeStruct(v reflect.Value, indent int) error {
 		}
 		e.buf.WriteString(name)
 		e.buf.WriteByte(':')
-		if err := e.writeEntry(fv, indent); err != nil {
+		if err := e.writeEntry(fv, indent, f.layout); err != nil {
 			return err
 		}
 	}
@@ -145,7 +203,7 @@ func (e *encoder) writeStruct(v reflect.Value, indent int) error {
 	return nil
 }
 
-func (e *encoder) writeSeq(v reflect.Value, indent int) error {
+func (e *encoder) writeSeq(v reflect.Value, indent int, layout string) error {
 	if v.Len() == 0 {
 		e.buf.WriteString("[]\n")
 		return nil
@@ -155,7 +213,7 @@ func (e *encoder) writeSeq(v reflect.Value, indent int) error {
 			e.pad(indent)
 		}
 		e.buf.WriteString("- ")
-		if err := e.writeNode(v.Index(i), indent+indentStep); err != nil {
+		if err := e.writeNode(v.Index(i), indent+e.s.indent, layout); err != nil {
 			return err
 		}
 	}
@@ -173,7 +231,7 @@ func deref(v reflect.Value) reflect.Value {
 				return reflect.Value{}
 			}
 			// A pointer that marshals itself is the value.
-			if isTextMarshaler(v) {
+			if isTextMarshaler(v) || isMarshaler(v) {
 				return v
 			}
 			v = v.Elem()
@@ -196,12 +254,38 @@ func isTextMarshaler(v reflect.Value) bool {
 	return ok
 }
 
+func isMarshaler(v reflect.Value) bool {
+	if !v.CanInterface() {
+		return false
+	}
+	_, ok := v.Interface().(Marshaler)
+	return ok
+}
+
 // scalarText renders v as a single-line scalar. ok is false when v is a
 // collection and needs a block of its own.
-func scalarText(v reflect.Value) (string, bool, error) {
+func (e *encoder) scalarText(v reflect.Value, layout string) (string, bool, error) {
 	if !v.IsValid() {
 		return "null", true, nil
 	}
+
+	// An encoder the caller registered is the counterpart of a
+	// registered parser, and wins for the same reason.
+	if len(e.s.encoders) > 0 {
+		if enc, ok := e.s.encoders[baseType(v.Type())]; ok {
+			txt, err := enc(v)
+			if err != nil {
+				return "", false, fmt.Errorf("yaml: %w", err)
+			}
+			s, err := plainOrQuoted(txt)
+			return s, true, err
+		}
+	}
+
+	if txt, ok, err := e.specialText(v, layout); ok || err != nil {
+		return txt, ok, err
+	}
+
 	if v.CanInterface() {
 		if m, ok := v.Interface().(encoding.TextMarshaler); ok {
 			b, err := m.MarshalText()
@@ -285,8 +369,8 @@ func emptyCollection(v reflect.Value) (bool, string) {
 
 // keyText renders a map key. Keys are scalars, so anything a scalar can
 // be is allowed, but a collection key is not representable here.
-func keyText(k reflect.Value) (string, error) {
-	txt, ok, err := scalarText(deref(k))
+func (e *encoder) keyText(k reflect.Value) (string, error) {
+	txt, ok, err := e.scalarText(deref(k), "")
 	if err != nil {
 		return "", err
 	}
@@ -299,7 +383,7 @@ func keyText(k reflect.Value) (string, error) {
 // sortedKeys orders map keys so that the output of a given value is
 // always byte for byte the same: numbers by value, everything else by
 // its rendered text.
-func sortedKeys(v reflect.Value) ([]reflect.Value, error) {
+func (e *encoder) sortedKeys(v reflect.Value) ([]reflect.Value, error) {
 	keys := v.MapKeys()
 	switch v.Type().Key().Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -317,7 +401,7 @@ func sortedKeys(v reflect.Value) ([]reflect.Value, error) {
 	}
 	texts := make(map[int]string, len(keys))
 	for i, k := range keys {
-		t, err := keyText(k)
+		t, err := e.keyText(k)
 		if err != nil {
 			return nil, err
 		}
@@ -467,4 +551,31 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.IsNil()
 	}
 	return false
+}
+
+// specialText renders the types this package writes as one scalar of
+// their own: a duration as "30s" rather than a count of nanoseconds, a
+// URL as the text it was written from rather than the dozen fields
+// net/url keeps it in.
+func (e *encoder) specialText(v reflect.Value, layout string) (string, bool, error) {
+	switch v.Type() {
+	case durationType:
+		s, err := plainOrQuoted(time.Duration(v.Int()).String())
+		return s, true, err
+	case timeType:
+		t, ok := v.Interface().(time.Time)
+		if !ok {
+			return "", false, nil
+		}
+		s, err := plainOrQuoted(t.Format(e.s.layoutFor(layout)))
+		return s, true, err
+	case urlType:
+		u, ok := v.Interface().(url.URL)
+		if !ok {
+			return "", false, nil
+		}
+		s, err := plainOrQuoted(u.String())
+		return s, true, err
+	}
+	return "", false, nil
 }

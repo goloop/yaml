@@ -244,7 +244,7 @@ func TestStrictMode(t *testing.T) {
 
 	t.Run("a typo is an error", func(t *testing.T) {
 		var c conf
-		err := UnmarshalStrict([]byte("retires: 3\n"), &c)
+		err := Unmarshal([]byte("retires: 3\n"), &c, WithStrict())
 		if err == nil {
 			t.Fatal("the typo was skipped")
 		}
@@ -266,7 +266,7 @@ func TestStrictMode(t *testing.T) {
 
 	t.Run("known keys decode either way", func(t *testing.T) {
 		var c conf
-		if err := UnmarshalStrict([]byte("retries: 3\n"), &c); err != nil {
+		if err := Unmarshal([]byte("retries: 3\n"), &c, WithStrict()); err != nil {
 			t.Fatal(err)
 		}
 		if c.Retries != 3 {
@@ -276,7 +276,7 @@ func TestStrictMode(t *testing.T) {
 
 	t.Run("a map target has no unknown keys", func(t *testing.T) {
 		var m map[string]int
-		if err := UnmarshalStrict([]byte("anything: 1\n"), &m); err != nil {
+		if err := Unmarshal([]byte("anything: 1\n"), &m, WithStrict()); err != nil {
 			t.Fatal(err)
 		}
 	})
